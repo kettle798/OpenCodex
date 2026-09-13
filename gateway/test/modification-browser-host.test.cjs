@@ -12,6 +12,9 @@ const BUNDLE = fs.readFileSync(
 class EventTargetStub {
   constructor() {
     this.listeners = new Map();
+    this.children = [];
+    this.isConnected = false;
+    this.parentNode = null;
   }
   addEventListener(type, callback) {
     if (!this.listeners.has(type)) this.listeners.set(type, new Set());
@@ -25,6 +28,19 @@ class EventTargetStub {
   }
   listenerCount(type) {
     return this.listeners.get(type)?.size || 0;
+  }
+  appendChild(child) {
+    child.parentNode = this;
+    child.isConnected = true;
+    this.children.push(child);
+    return child;
+  }
+  removeChild(child) {
+    const index = this.children.indexOf(child);
+    if (index >= 0) this.children.splice(index, 1);
+    child.parentNode = null;
+    child.isConnected = false;
+    return child;
   }
 }
 
@@ -66,6 +82,14 @@ function createHarness() {
   window.cancelAnimationFrame = cancel;
   const document = new EventTargetStub();
   document.documentElement = new EventTargetStub();
+  document.documentElement.isConnected = true;
+  document.head = new EventTargetStub();
+  document.head.isConnected = true;
+  document.createElement = (tagName) => {
+    const element = new EventTargetStub();
+    element.tagName = String(tagName || "").toUpperCase();
+    return element;
+  };
   window.window = window;
   vm.runInNewContext(BUNDLE, {
     console,
@@ -317,6 +341,43 @@ test("browser protocol pipeline decodes each frame once and fans out by channel"
   assert.equal(host.diagnostics().protocolSubscriberCount, 0);
 });
 
+test("browser protocol pipeline applies ordered point-scoped transforms and restores the original value", () => {
+  const { host } = createHarness();
+  const channel = host.protocol.channels.gateway;
+  const calls = [];
+  const disposeLate = host.protocol.transform({
+    key: {},
+    channel,
+    order: 20,
+    callback(frame) {
+      calls.push("late");
+      return { ...frame.value, total: frame.value.total + 2 };
+    },
+  });
+  const disposeEarly = host.protocol.transform({
+    key: {},
+    channel,
+    order: 10,
+    callback(frame) {
+      calls.push("early");
+      return { ...frame.value, total: frame.value.total * 3 };
+    },
+  });
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(host.protocol.process({ channel, value: '{"total":4}' }))),
+    { total: 14 }
+  );
+  assert.deepEqual(calls, ["early", "late"]);
+  assert.equal(host.diagnostics().protocolTransformCount, 2);
+  assert.equal(host.diagnostics().protocolTransformerCount, 2);
+
+  disposeEarly();
+  disposeLate();
+  assert.equal(host.protocol.process({ channel, value: "unchanged" }), "unchanged");
+  assert.equal(host.diagnostics().protocolTransformerCount, 0);
+});
+
 test("browser providers execute through Kernel and emit Contribution-level snapshots", async () => {
   const harness = createHarness();
   const snapshots = [];
@@ -347,6 +408,117 @@ test("browser providers execute through Kernel and emit Contribution-level snaps
   assert.equal(point.contributions[0].hitCount, 1);
 });
 
+test("mobile sidebar touch scrolling is a separate v2 point owned by the plugin lifecycle", async () => {
+  const harness = createHarness();
+  const snapshots = [];
+  let registeredPlugin = null;
+  harness.window.OpenCodexRuntimeCompatibility = {
+    clientId: "browser_mobile_sidebar_touch_scroll",
+    ingestSnapshot(snapshot) {
+      snapshots.push(snapshot);
+    },
+  };
+  const pluginSystem = {
+    registerPlugin(plugin) {
+      registeredPlugin = plugin;
+    },
+  };
+  harness.host.providers.register("mobile-sidebar", () => {
+    harness.host.plugins.register(pluginSystem, {
+      id: "opencodex.mobile-sidebar-auto-collapse",
+      activate() {
+        return () => {};
+      },
+    });
+  });
+
+  await harness.host.providers.activate();
+  await Promise.resolve();
+  const pointId = "web.runtime.plugin.mobile-sidebar-touch-scroll";
+  let point = snapshots.at(-1).points.find((item) => item.id === pointId);
+  assert.equal(point.status, "disabled");
+  assert.equal(point.plugin.id, "opencodex.mobile-sidebar-auto-collapse");
+  assert.equal(point.directAdapterIds[0], "adapter.semantic-view");
+  assert.equal(point.contributions[0].adapterId, "adapter.runtime-view");
+  assert.equal(harness.document.head.children.length, 0);
+
+  const disposePlugin = registeredPlugin.activate({ scope: "renderer" });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(harness.document.head.children.length, 1);
+  const style = harness.document.head.children[0];
+  assert.equal(style.id, "opencodex-mobile-sidebar-touch-scroll-styles");
+  assert.match(style.textContent, /@media \(max-width: 820px\), \(pointer: coarse\)/);
+  assert.match(style.textContent, /\[data-app-action-sidebar-scroll\] \[role="listitem"\]/);
+  assert.match(style.textContent, /touch-action: pan-y !important/);
+  point = snapshots.at(-1).points.find((item) => item.id === pointId);
+  assert.equal(point.status, "active");
+  assert.equal(point.contributions[0].hitCount, 1);
+
+  disposePlugin();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(harness.document.head.children.length, 0);
+  point = snapshots.at(-1).points.find((item) => item.id === pointId);
+  assert.equal(point.status, "disabled");
+
+  const disposeReenabledPlugin = registeredPlugin.activate({ scope: "renderer" });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(harness.document.head.children.length, 1);
+  disposeReenabledPlugin();
+  await Promise.resolve();
+  assert.equal(harness.document.head.children.length, 0);
+});
+
+test("WCO is created and released as a managed runtime-view contribution", async () => {
+  const harness = createHarness();
+  const snapshots = [];
+  let createCount = 0;
+  let disposeCount = 0;
+  harness.window.OpenCodexRuntimeCompatibility = {
+    clientId: "browser_wco_managed_contribution",
+    ingestSnapshot(snapshot) {
+      snapshots.push(snapshot);
+    },
+  };
+  harness.host.providers.register("window-controls", () => {
+    assert.equal(harness.document.head.children.length, 0);
+    harness.host.providers.registerManaged("window-controls", "primary", ({ onHit }) => {
+      createCount += 1;
+      const style = harness.document.createElement("style");
+      style.id = "test-wco-managed-style";
+      harness.document.head.appendChild(style);
+      onHit();
+      return {
+        verify() {
+          assert.equal(style.isConnected, true);
+        },
+        dispose() {
+          disposeCount += 1;
+          style.parentNode?.removeChild(style);
+        },
+      };
+    });
+  });
+
+  await harness.host.providers.activate();
+  await Promise.resolve();
+  assert.equal(createCount, 1);
+  assert.equal(harness.document.head.children.length, 1);
+  const point = snapshots.at(-1).points.find((item) => item.id === "web.runtime.dom.window-controls-overlay");
+  assert.equal(point.directAdapterIds[0], "adapter.semantic-view");
+  assert.equal(point.contributions[0].adapterId, "adapter.runtime-view");
+  assert.equal(point.status, "active");
+
+  // 页面代际切换会先回滚 RuntimeView Contribution，再释放 Provider 注册和资源。
+  harness.host.providers.beginPage(new EventTargetStub());
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(disposeCount, 1);
+  assert.equal(harness.document.head.children.length, 0);
+});
+
 test("browser provider resources are released and reinstalled for each document generation", async () => {
   const harness = createHarness();
   const generations = [];
@@ -361,22 +533,30 @@ test("browser provider resources are released and reinstalled for each document 
         type: "provider-generation-test",
         callback() {},
       });
+      harness.host.protocol.transform({
+        key: {},
+        channel: harness.host.protocol.channels.gateway,
+        callback() {},
+      });
     });
   };
 
   installProvider();
   await harness.host.providers.activate();
   assert.equal(harness.window.listenerCount("provider-generation-test"), 1);
+  assert.equal(harness.host.diagnostics().protocolTransformerCount, 1);
 
   const nextRoot = new EventTargetStub();
   harness.host.providers.beginPage(nextRoot);
   assert.equal(harness.window.listenerCount("provider-generation-test"), 0);
+  assert.equal(harness.host.diagnostics().protocolTransformerCount, 0);
   installProvider();
   await harness.host.providers.activate();
 
   assert.equal(installCount, 2);
   assert.deepEqual(generations, [1, 2]);
   assert.equal(harness.window.listenerCount("provider-generation-test"), 1);
+  assert.equal(harness.host.diagnostics().protocolTransformerCount, 1);
 });
 
 test("browser provider cleans partial resources when a later installer fails", async () => {

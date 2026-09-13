@@ -1,15 +1,18 @@
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const asar = require("@electron/asar");
 
 const {
   CodexAsarScanner,
   CodexAsarCandidateProvider,
 } = require("../dist/official/CodexAsarScanner.js");
 const { AsarWebviewExtractor } = require("../dist/official/AsarWebviewExtractor.js");
+const { LocalCodexBundleProvider } = require("../dist/official/LocalCodexBundleProvider.js");
 const { OfficialBundleCache } = require("../dist/official/OfficialBundleCache.js");
 const { OfficialBundleFileSystem } = require("../dist/official/OfficialBundleFileSystem.js");
 const { OfficialRuntimeOptimizer } = require("../dist/official/OfficialRuntimeOptimizer.js");
@@ -29,9 +32,10 @@ const {
   OfficialRuntimeEntryResolver,
 } = require("../dist/official/OfficialRuntimeEntryResolver.js");
 const { __test: layoutTest } = require("../runner/official-layout.cjs");
+const { createMacRunner } = require("../runner/platform/macos.cjs");
 const { MANIFEST_SCHEMA_VERSION } = require("../dist/official/constants.js");
 const { createCompatibilityService } = require("../runtime/compatibility/service.cjs");
-const { staticMain: staticMainPoints } = require("../runtime/modification/point-refs.cjs");
+const { runner: runnerPoints, staticMain: staticMainPoints } = require("../runtime/modification/point-refs.cjs");
 
 function temporaryDirectory(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "opencodex-desktop-compat-"));
@@ -57,7 +61,7 @@ test("gateway compatibility service initializes from configured runtime paths", 
   });
   try {
     const snapshot = compatibilityService.snapshot();
-    assert.equal(snapshot.points.length, 102);
+    assert.equal(snapshot.points.length, 103);
     assert.equal(snapshot.groups.length, 17);
     assert.equal(snapshot.adapterTypes.length, 23);
     assert.equal(Object.hasOwn(snapshot, "features"), false);
@@ -436,6 +440,56 @@ test("runtime optimizer patches every native pet factory and prewarm in one chun
     optimized,
     /if\(this\.window!=null\|\|this\.openingWindowPromise!=null\|\|this\.isAppQuitting\)return/
   );
+});
+
+test("runtime optimizer patches the renamed avatar overlay paths in new official runtimes", (t) => {
+  const bundleDir = temporaryDirectory(t);
+  const mainPath = path.join(bundleDir, ".vite", "build", "main-avatar-overlay.js");
+  writeFile(
+    mainPath,
+    "var Overlay=class{logger=log(`avatar-overlay`);supportsInputShape=BrowserWindow.isInputShapeSupported();" +
+      "async restoreOpenState(e){this.globalState.get(`electron-avatar-overlay-open`)===!0&&await this.open(e)}" +
+      "async prewarm(e){if(this.window!=null||this.openingWindowPromise!=null||this.isAppQuitting)return;await this.ensureWindow(e)}" +
+      "async ensureWindow(e){if(this.isAppQuitting)return null;return this.createWindow(e)}}"
+  );
+  const compatibilityService = createCompatibilityService();
+  const optimizer = new OfficialRuntimeOptimizer({
+    fileSystem: new OfficialBundleFileSystem(),
+    compatibilityService,
+  });
+
+  try {
+    assert.deepEqual(optimizer.optimize(bundleDir), {
+      nativePetComposition: "gateway-css-fallback",
+      nativePetPrewarm: "gateway-lazy",
+      macPushRegistration: "not-present",
+      patchedFileCount: 1,
+      unsupportedFiles: [],
+    });
+    const optimized = fs.readFileSync(mainPath, "utf8");
+    // 新版保留 Manager 对象协议，但窗口创建、预热和 Profile 恢复都不能在隐藏 runtime 中发生。
+    assert.match(
+      optimized,
+      /async ensureWindow\(e\)\{if\(process\.env\.OPENCODEX_GATEWAY_HIDDEN_RUNTIME===`1`\|\|this\.isAppQuitting\)return null;/
+    );
+    assert.match(
+      optimized,
+      /async prewarm\(e\)\{if\(process\.env\.OPENCODEX_GATEWAY_HIDDEN_RUNTIME===`1`\|\|this\.window!=null/
+    );
+    assert.match(
+      optimized,
+      /async restoreOpenState\(e\)\{process\.env\.OPENCODEX_GATEWAY_HIDDEN_RUNTIME!==`1`&&this\.globalState/
+    );
+    for (const pointId of [
+      "static.cache.main.native-pet.factory",
+      "static.cache.main.native-pet.prewarm",
+      "static.cache.main.native-pet.restore",
+    ]) {
+      assert.equal(compatibilityService.registry.point(pointId).status, "healthy");
+    }
+  } finally {
+    compatibilityService.dispose();
+  }
 });
 
 test("runtime optimizer reports a partially recognized native pet chunk", (t) => {
@@ -966,12 +1020,63 @@ test("runtime optimizer leaves bundles without native pet composition unchanged"
   assert.equal(fs.readFileSync(mainPath, "utf8"), "module.exports = { ok: true };");
 });
 
+test("runtime optimizer disables removed native pet points without degrading new official runtimes", (t) => {
+  const bundleDir = temporaryDirectory(t);
+  writeFile(path.join(bundleDir, ".vite", "build", "main.js"), "module.exports = { ok: true };");
+  const compatibilityService = createCompatibilityService();
+  const optimizer = new OfficialRuntimeOptimizer({
+    fileSystem: new OfficialBundleFileSystem(),
+    compatibilityService,
+  });
+
+  try {
+    optimizer.optimize(bundleDir);
+    // 新版完全移除 Native Pet 时没有可执行补丁，三个点都应显示为不适用而不是降级。
+    for (const pointId of [
+      "static.cache.main.native-pet.factory",
+      "static.cache.main.native-pet.prewarm",
+      "static.cache.main.native-pet.restore",
+    ]) {
+      assert.equal(compatibilityService.registry.point(pointId).status, "disabled");
+    }
+  } finally {
+    compatibilityService.dispose();
+  }
+});
+
+test("cached optimization preserves removed native pet points as disabled", () => {
+  const compatibilityService = createCompatibilityService();
+  const provider = new LocalCodexBundleProvider({ compatibilityService });
+
+  try {
+    provider.reportCachedOptimizationCompatibility({
+      nativePetComposition: "not-present",
+      nativePetPrewarm: "not-present",
+      macPushRegistration: "gateway-disabled",
+      patchedFileCount: 0,
+      unsupportedFiles: [],
+    });
+    // 缓存命中不能把首次扫描得到的“不适用”重新解释成“不支持”。
+    for (const pointId of [
+      "static.cache.main.native-pet.factory",
+      "static.cache.main.native-pet.prewarm",
+      "static.cache.main.native-pet.restore",
+    ]) {
+      assert.equal(compatibilityService.registry.point(pointId).status, "disabled");
+    }
+  } finally {
+    compatibilityService.dispose();
+  }
+});
+
 test("runtime optimizer keeps gateway compatible when an official native pet layout changes", (t) => {
   const bundleDir = temporaryDirectory(t);
   const mainPath = path.join(bundleDir, ".vite", "build", "main-new-layout.js");
   writeFile(mainPath, 'console.log("Native pet material attachment completed");');
+  const compatibilityService = createCompatibilityService();
   const optimizer = new OfficialRuntimeOptimizer({
     fileSystem: new OfficialBundleFileSystem(),
+    compatibilityService,
   });
 
   assert.deepEqual(optimizer.optimize(bundleDir), {
@@ -985,6 +1090,15 @@ test("runtime optimizer keeps gateway compatible when an official native pet lay
     fs.readFileSync(mainPath, "utf8"),
     'console.log("Native pet material attachment completed");'
   );
+  // 能力仍存在但定位器失配时继续报告真实降级，不能被“新版不适用”分支掩盖。
+  for (const pointId of [
+    "static.cache.main.native-pet.factory",
+    "static.cache.main.native-pet.prewarm",
+    "static.cache.main.native-pet.restore",
+  ]) {
+    assert.equal(compatibilityService.registry.point(pointId).status, "degraded");
+  }
+  compatibilityService.dispose();
 });
 
 test("runtime optimizer reports unsupported when any native pet marker file cannot be fully patched", (t) => {
@@ -1130,6 +1244,66 @@ test("macOS layout reads both ChatGPT and Codex executables from Info.plist", (t
   }
 });
 
+test("macOS runner embeds its current ASAR header hash before signing, including cache reuse", async (t) => {
+  const root = temporaryDirectory(t);
+  const appRoot = path.join(root, "ChatGPT.app");
+  const layout = {
+    appRoot,
+    executablePath: path.join(appRoot, "Contents", "MacOS", "ChatGPT"),
+    asarPath: path.join(appRoot, "Contents", "Resources", "app.asar"),
+    frameworksDir: path.join(appRoot, "Contents", "Frameworks"),
+  };
+  writeFile(layout.executablePath, "official executable");
+  writeFile(layout.asarPath, "official archive must remain unchanged");
+  fs.mkdirSync(layout.frameworksDir, { recursive: true });
+  const runtimeDir = path.join(root, "runtime");
+  const logs = [];
+  const hashes = [];
+
+  for (const revision of [1, 2]) {
+    const points = [];
+    await createMacRunner({
+      layout,
+      runtimeDir,
+      logger: (line) => logs.push(line),
+      runCompatibility(point, operation) {
+        points.push(point.id);
+        if (point === runnerPoints.gatewayAsar) {
+          return (async () => {
+            const asarPath = await operation();
+            // 模拟入口升级，让第二次构建的哈希发生变化，覆盖 Frameworks 缓存命中后的重新计算。
+            const sourceDir = path.join(runtimeDir, "official-electron-runner", "app-src");
+            fs.appendFileSync(path.join(sourceDir, "main.cjs"), `\n// fixture revision ${revision}\n`);
+            await asar.createPackage(sourceDir, asarPath);
+            return asarPath;
+          })();
+        }
+        if (point === runnerPoints.macosEntrySignature) {
+          // 只替换平台签名操作；真实执行打包与 plist 生成，并在签名前检查最终产物。
+          const workDir = path.join(runtimeDir, "official-electron-runner");
+          const runnerApp = fs.readdirSync(workDir).find((name) => name.endsWith(".app"));
+          const contentsDir = path.join(workDir, runnerApp, "Contents");
+          const asarPath = path.join(contentsDir, "Resources", "app.asar");
+          const hash = crypto.createHash("sha256").update(asar.getRawHeader(asarPath).headerString).digest("hex");
+          const plist = fs.readFileSync(path.join(contentsDir, "Info.plist"), "utf8");
+          assert.match(plist, /<key>ElectronAsarIntegrity<\/key>\s*<dict>\s*<key>Resources\/app\.asar<\/key>\s*<dict>\s*<key>algorithm<\/key>\s*<string>SHA256<\/string>\s*<key>hash<\/key>/);
+          assert.ok(plist.includes(`<string>${hash}</string>`));
+          assert.match(plist, /<key>LSBackgroundOnly<\/key>\s*<true\/>/);
+          hashes.push(hash);
+          return;
+        }
+        return operation();
+      },
+    });
+    assert.deepEqual(points, [runnerPoints.gatewayAsar.id, runnerPoints.macosBackgroundBundle.id, runnerPoints.macosEntrySignature.id]);
+  }
+
+  assert.notEqual(hashes[0], hashes[1]);
+  assert.ok(logs.some((line) => line.includes("Frameworks cache hit")));
+  assert.equal(fs.readFileSync(layout.asarPath, "utf8"), "official archive must remain unchanged");
+  assert.equal(fs.readFileSync(layout.executablePath, "utf8"), "official executable");
+});
+
 test("Linux executable candidates retain Codex names and add electron fallback", () => {
   const appRoot = "/opt/codex-app";
   const candidates = layoutTest.linuxElectronExecutableCandidates(appRoot);
@@ -1138,4 +1312,153 @@ test("Linux executable candidates retain Codex names and add electron fallback",
   assert.ok(candidates.includes(path.join(appRoot, "Codex")));
   assert.ok(candidates.includes(path.join(appRoot, "codex-desktop")));
   assert.ok(candidates.includes(path.join(appRoot, "electron")));
+});
+
+// 验证压缩导出名变化后的真实执行语义，同时覆盖旧版与缓存幂等性。
+for (const exportName of ["a", "i", "$new"]) {
+  test(`macOS push accepts enum export ${exportName} and preserves platform behavior`, (t) => {
+    const bundleDir = temporaryDirectory(t);
+    const mainPath = path.join(bundleDir, ".vite", "build", "main-push.js");
+    writeFile(mainPath, `process.platform!==\`darwin\`||flavor!==a.${exportName}.Prod||register({appServerClient:client}).catch(e=>logger.warning(\`Failed to register macOS push notifications\`,e));`);
+    const optimizer = new OfficialRuntimeOptimizer({ fileSystem: new OfficialBundleFileSystem() });
+    assert.equal(optimizer.optimize(bundleDir).macPushRegistration, "gateway-disabled");
+    const source = fs.readFileSync(mainPath, "utf8");
+    for (const [platform, hidden, flavor, expected] of [["darwin", "1", "prod", 0], ["darwin", "0", "prod", 1], ["linux", "0", "prod", 0], ["darwin", "0", "dev", 0]]) {
+      let calls = 0;
+      new Function("process", "flavor", "a", "register", "client", "logger", source)(
+        { platform, env: { OPENCODEX_GATEWAY_HIDDEN_RUNTIME: hidden } }, flavor,
+        { [exportName]: { Prod: "prod" } }, () => { calls++; return Promise.resolve(); }, {}, {},
+      );
+      assert.equal(calls, expected);
+    }
+    assert.equal(optimizer.optimize(bundleDir).patchedFileCount, 0);
+    assert.equal(fs.readFileSync(mainPath, "utf8"), source);
+  });
+}
+
+test("unsupported push stays inactive on fresh optimization and cache reuse", (t) => {
+  const bundleDir = temporaryDirectory(t);
+  writeFile(path.join(bundleDir, ".vite", "build", "main-push.js"), "console.log(`Failed to register macOS push notifications`)");
+  for (const cached of [false, true]) {
+    const service = createCompatibilityService();
+    try {
+      if (cached) new LocalCodexBundleProvider({ compatibilityService: service }).reportCachedOptimizationCompatibility({ macPushRegistration: "unsupported-layout" });
+      else new OfficialRuntimeOptimizer({ fileSystem: new OfficialBundleFileSystem(), compatibilityService: service }).optimize(bundleDir);
+      const point = service.registry.point(staticMainPoints.macosPushRegistration.id);
+      assert.equal(point.location.status, "unsupported");
+      assert.equal(point.application.status, "pending");
+      assert.equal(point.verification.status, "pending");
+      assert.equal(point.activation.status, "inactive");
+      assert.equal(point.fallback.active, true);
+    } finally { service.dispose(); }
+  }
+});
+
+// 多余候选可能属于无关调用，必须保留原文并报告歧义。
+test("ambiguous macOS push candidates are not patched", (t) => {
+  const bundleDir = temporaryDirectory(t);
+  const mainPath = path.join(bundleDir, ".vite", "build", "main-push.js");
+  const call = "process.platform!==`darwin`||g!==a.i.Prod||register({appServerClient:client});";
+  const source = call + call + "console.log(`Failed to register macOS push notifications`);";
+  writeFile(mainPath, source);
+  const service = createCompatibilityService();
+  try {
+    const result = new OfficialRuntimeOptimizer({ fileSystem: new OfficialBundleFileSystem(), compatibilityService: service }).optimize(bundleDir);
+    assert.equal(result.macPushRegistration, "unsupported-layout");
+    assert.equal(fs.readFileSync(mainPath, "utf8"), source);
+    assert.equal(service.registry.point(staticMainPoints.macosPushRegistration.id).location.status, "ambiguous");
+  } finally { service.dispose(); }
+});
+
+// 在真实临时目录中验证备份轮换及失败恢复，不触碰用户运行时。
+function createBackupFixture(t) {
+  const projectRoot = temporaryDirectory(t);
+  const fileSystem = new OfficialBundleFileSystem();
+  const bundleDir = path.join(projectRoot, "bundle");
+  const sourceAsarPath = path.join(projectRoot, "resources", "app.asar");
+  writeFile(sourceAsarPath);
+  const cache = new OfficialBundleCache({ projectRoot, configuredBundleDir: bundleDir, fileSystem, logger: { warn() {} } });
+  function createBundle(dir, version) {
+    for (const file of ["webview/index.html", "webview/assets/app.js", "node_modules/fixture/index.js", ".vite/build/bootstrap.js"]) {
+      writeFile(path.join(dir, file));
+    }
+    writeFile(path.join(dir, "package.json"), "{}");
+    writeFile(path.join(dir, "manifest.json"), JSON.stringify({ schemaVersion: MANIFEST_SCHEMA_VERSION, runtimeOptimizations: {}, sourceAsarPath, version }));
+    return dir;
+  }
+  const versionAt = (dir) => JSON.parse(fs.readFileSync(path.join(dir, "manifest.json"))).version;
+  return { projectRoot, fileSystem, bundleDir, cache, createBundle, versionAt };
+}
+
+test("bundle updates retain exactly the previous backup and restore it", (t) => {
+  const { projectRoot, bundleDir, cache, createBundle, versionAt } = createBackupFixture(t);
+  cache.replaceWith(createBundle(path.join(projectRoot, "first"), "1"));
+  assert.equal(fs.existsSync(cache.backupDir), false);
+  cache.replaceWith(createBundle(path.join(projectRoot, "second"), "2"));
+  assert.equal(versionAt(cache.backupDir), "1");
+  cache.replaceWith(createBundle(path.join(projectRoot, "third"), "3"));
+  assert.equal(versionAt(cache.backupDir), "2");
+  assert.equal(cache.backupState().available, true);
+  cache.restoreBackup();
+  assert.equal(versionAt(bundleDir), "2");
+  assert.equal(fs.existsSync(cache.backupDir), false);
+  assert.equal(fs.readdirSync(projectRoot).some((name) => name.includes(".restore-") || name.includes(".tmp-")), false);
+});
+
+test("failed bundle replacement preserves current bundle and previous backup", (t) => {
+  const { projectRoot, bundleDir, cache, createBundle, versionAt } = createBackupFixture(t);
+  createBundle(bundleDir, "2");
+  createBundle(cache.backupDir, "1");
+  assert.throws(() => cache.replaceWith(path.join(projectRoot, "missing")));
+  assert.equal(versionAt(bundleDir), "2");
+  assert.equal(versionAt(cache.backupDir), "1");
+});
+
+test("failed restore rename preserves both bundles and invalid backup leaves current untouched", (t) => {
+  const { bundleDir, cache, fileSystem, createBundle, versionAt } = createBackupFixture(t);
+  createBundle(bundleDir, "2");
+  createBundle(cache.backupDir, "1");
+  const rename = fileSystem.rename.bind(fileSystem);
+  fileSystem.rename = (from, to) => {
+    if (from === cache.backupDir) throw new Error("rename denied");
+    rename(from, to);
+  };
+  assert.throws(() => cache.restoreBackup(), /rename denied/);
+  assert.equal(versionAt(bundleDir), "2");
+  assert.equal(versionAt(cache.backupDir), "1");
+  fs.rmSync(path.join(cache.backupDir, "package.json"));
+  assert.equal(cache.backupState().available, false);
+  assert.throws(() => cache.restoreBackup(), /无法还原备份/);
+  assert.equal(versionAt(bundleDir), "2");
+});
+
+test("launcher restore preserves either scan setting and skips only its restart", async () => {
+  const vm = require("node:vm");
+  const source = fs.readFileSync(path.join(__dirname, "../../launcher/main.cjs"), "utf8");
+  // 执行实际生命周期函数，替换 Electron 与文件系统边界来验证调用顺序。
+  const lifecycle = source.slice(source.indexOf("async function restartGatewayOnce("), source.indexOf("\nfunction createWindow()"));
+  for (const autoScan of [true, false]) {
+    const events = [];
+    const settings = { officialAutoScanUpgrade: autoScan };
+    const context = vm.createContext({
+      gatewayStartPromise: null, gatewayRestartPromise: null,
+      skipNextOfficialScan: false, restoringBackup: false,
+      gatewayState: { settings, status: {} },
+      officialBundleCache: () => ({ backupState: () => ({ available: true }), restoreBackup: () => events.push("restore") }),
+      stopGateway: async () => { events.push("stop"); return true; },
+      startGateway: async () => { events.push(context.skipNextOfficialScan ? "start-without-scan" : "start"); context.skipNextOfficialScan = false; },
+      buildState: () => ({}), broadcastState() {}, appendLog() {}, errorLogText: String,
+    });
+    vm.runInContext(lifecycle, context);
+    await context.restoreBundleBackup();
+    assert.deepEqual(events, ["stop", "restore", "start-without-scan"]);
+    assert.deepEqual(settings, { officialAutoScanUpgrade: autoScan });
+    await context.restartGateway();
+    assert.deepEqual(events.slice(-2), ["stop", "start"]);
+    events.length = 0;
+    context.stopGateway = async () => false;
+    await context.restoreBundleBackup();
+    assert.deepEqual(events, []);
+    assert.equal(context.skipNextOfficialScan, false);
+  }
 });

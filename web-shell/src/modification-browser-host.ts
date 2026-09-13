@@ -1,6 +1,7 @@
 import {
   ADAPTER_DEFINITIONS,
   BASE_ADAPTERS,
+  BUILTIN_BROWSER_TARGETS,
   POINT_DEFINITIONS,
   POINT_GROUP_DEFINITIONS,
   registerModificationCatalog,
@@ -56,6 +57,14 @@ interface ProtocolSubscription {
   readonly propagateErrors: boolean;
 }
 
+interface ProtocolTransformSubscription {
+  readonly key: object;
+  readonly owner: BrowserProviderScope | null;
+  readonly order: number;
+  readonly callback: (frame: ProtocolFrame) => unknown;
+  readonly propagateErrors: boolean;
+}
+
 interface EventEntry {
   readonly target: EventTarget;
   readonly type: string;
@@ -90,6 +99,8 @@ interface AdapterHostDiagnostics {
   readonly protocolDecodeCount: number;
   readonly protocolDispatchCount: number;
   readonly protocolSubscriberCount: number;
+  readonly protocolTransformCount: number;
+  readonly protocolTransformerCount: number;
 }
 
 interface BrowserKernelTransport {
@@ -100,6 +111,14 @@ interface BrowserKernelTransport {
 
 interface BrowserProviderInstaller {
   (): void | (() => void);
+}
+
+interface BrowserManagedContributionContext {
+  readonly onHit: () => void;
+}
+
+interface BrowserManagedContributionFactory {
+  (context: BrowserManagedContributionContext): ManagedBrowserContribution;
 }
 
 interface BrowserProviderDefinition {
@@ -129,6 +148,8 @@ interface BrowserProviderState {
   readonly disposers: (() => void)[];
   readonly applications: Set<symbol>;
   readonly enabledCallbacks: Set<(enabled: boolean, reason: string) => void>;
+  readonly lifecycleCallbacks: Set<(enabled: boolean) => void>;
+  readonly managedFactories: Map<string, BrowserManagedContributionFactory>;
   scope: BrowserProviderScope | null;
   enabled: boolean | null;
   installed: boolean;
@@ -166,7 +187,13 @@ const BROWSER_PROVIDER_DEFINITIONS: readonly BrowserProviderDefinition[] = Objec
   { key: "offscreen-animation", points: { primary: "web.runtime.dom.offscreen-animation" } },
   { key: "mobile-keyboard", points: { primary: "web.runtime.plugin.mobile-keyboard" } },
   { key: "ios-layout", points: { primary: "web.runtime.plugin.ios-layout" } },
-  { key: "mobile-sidebar", points: { primary: "web.runtime.plugin.mobile-sidebar" } },
+  {
+    key: "mobile-sidebar",
+    points: {
+      primary: "web.runtime.plugin.mobile-sidebar",
+      touchScroll: "web.runtime.plugin.mobile-sidebar-touch-scroll",
+    },
+  },
   { key: "token-usage-inline", points: { primary: "web.runtime.dom.token-usage-inline" } },
   { key: "project-recent-sort", points: { primary: "web.runtime.plugin.project-recent-sort" } },
   { key: "smart-settings", points: { primary: "web.runtime.smart-router.settings" } },
@@ -206,6 +233,76 @@ const BROWSER_PROVIDER_DEFINITIONS: readonly BrowserProviderDefinition[] = Objec
   { key: "tooltip-dismiss", points: { primary: "web.runtime.dom.tooltip-dismiss" } },
 ]);
 
+const MOBILE_SIDEBAR_TOUCH_SCROLL_STYLE_ID = "opencodex-mobile-sidebar-touch-scroll-styles";
+const MOBILE_SIDEBAR_TOUCH_SCROLL_CSS = `
+  @media (max-width: 820px), (pointer: coarse) {
+    /* 官方可排序列表项会设置 touch-action:none；必须在手势开始前允许纵向原生滚动。 */
+    [data-app-action-sidebar-scroll] [role="listitem"],
+    [data-app-action-sidebar-scroll] [data-app-action-sidebar-thread-row] {
+      touch-action: pan-y !important;
+    }
+  }
+`;
+
+interface ManagedBrowserContribution {
+  verify(): void;
+  dispose(): void;
+}
+
+function isMobileSidebarTouchScrollContribution(contribution: BoundContribution): boolean {
+  const declaration = contribution.declaration as { readonly target?: unknown };
+  return contribution.adapter === BASE_ADAPTERS.runtimeView &&
+    declaration.target === BUILTIN_BROWSER_TARGETS.mobileSidebarTouchScroll;
+}
+
+function isWindowControlsOverlayContribution(contribution: BoundContribution): boolean {
+  const declaration = contribution.declaration as { readonly target?: unknown };
+  return contribution.adapter === BASE_ADAPTERS.runtimeView &&
+    declaration.target === BUILTIN_BROWSER_TARGETS.windowControlsOverlay;
+}
+
+function installMobileSidebarTouchScrollContribution(
+  state: BrowserProviderState,
+  onHit: () => void,
+): ManagedBrowserContribution {
+  let active = true;
+  let style: HTMLStyleElement | null = null;
+
+  const unmount = () => {
+    style?.parentNode?.removeChild(style);
+    style = null;
+  };
+  const synchronize = (enabled: boolean) => {
+    if (!active || !enabled || style) {
+      if (!enabled) unmount();
+      return;
+    }
+    const node = document.createElement("style");
+    node.id = MOBILE_SIDEBAR_TOUCH_SCROLL_STYLE_ID;
+    node.textContent = MOBILE_SIDEBAR_TOUCH_SCROLL_CSS;
+    (document.head || document.documentElement).appendChild(node);
+    style = node;
+    onHit();
+  };
+
+  state.lifecycleCallbacks.add(synchronize);
+  if (state.enabled != null) synchronize(state.enabled);
+  return Object.freeze({
+    verify() {
+      if (!active) throw new Error("移动端侧栏触摸滚动 Contribution 已经释放");
+      if (state.enabled === true && !style?.isConnected) {
+        throw new Error("移动端侧栏触摸滚动样式没有连接到当前页面");
+      }
+    },
+    dispose() {
+      if (!active) return;
+      active = false;
+      state.lifecycleCallbacks.delete(synchronize);
+      unmount();
+    },
+  });
+}
+
 const observerEntries = new Map<Node, ObserverEntry>();
 const eventEntries = new Map<string, EventEntry>();
 const eventTargetIds = new WeakMap<object, number>();
@@ -216,9 +313,11 @@ let eventDispatchCount = 0;
 let hookInvocationCount = 0;
 let protocolDecodeCount = 0;
 let protocolDispatchCount = 0;
+let protocolTransformCount = 0;
 let eventTargetSequence = 0;
 const protocolChannelTokens = new WeakSet<object>();
 const protocolSubscriptions = new Map<ProtocolChannelRef, Map<object, ProtocolSubscription>>();
+const protocolTransformSubscriptions = new Map<ProtocolChannelRef, Map<object, ProtocolTransformSubscription>>();
 
 function ownProviderDisposer(dispose: () => void): () => void {
   const scope = window.__OpenCodexCurrentProviderScope;
@@ -436,6 +535,7 @@ function defineProtocolChannel(id: string): ProtocolChannelRef {
   const channel = Object.freeze({ id });
   protocolChannelTokens.add(channel);
   protocolSubscriptions.set(channel, new Map());
+  protocolTransformSubscriptions.set(channel, new Map());
   return channel;
 }
 
@@ -635,6 +735,33 @@ function decodeProtocolValue(raw: unknown): unknown {
   }
 }
 
+function createProtocolFrame(
+  raw: unknown,
+  metadata: Readonly<Record<string, unknown>> = {},
+): ProtocolFrame {
+  let decoded = false;
+  let decodedValue: unknown;
+  const decodeOnce = () => {
+    if (!decoded) {
+      decodedValue = decodeProtocolValue(raw);
+      decoded = true;
+    }
+    return decodedValue;
+  };
+  return Object.freeze(Object.defineProperties({}, {
+    raw: { enumerable: true, value: raw },
+    metadata: { enumerable: true, value: Object.freeze({ ...metadata }) },
+    value: {
+      enumerable: true,
+      get: decodeOnce,
+    },
+    decode: {
+      enumerable: false,
+      value: decodeOnce,
+    },
+  })) as ProtocolFrame;
+}
+
 function observeProtocol(input: {
   key: object;
   channel: ProtocolChannelRef;
@@ -658,6 +785,67 @@ function observeProtocol(input: {
   });
 }
 
+function transformProtocol(input: {
+  key: object;
+  channel: ProtocolChannelRef;
+  order?: number;
+  propagateErrors?: boolean;
+  callback: (frame: ProtocolFrame) => unknown;
+}): () => void {
+  if (!protocolChannelTokens.has(input.channel as object)) throw new TypeError("协议转换必须引用宿主 Channel 对象");
+  if (!input.key || typeof input.callback !== "function") throw new TypeError("协议转换声明不完整");
+  const subscriptions = protocolTransformSubscriptions.get(input.channel);
+  if (!subscriptions) throw new TypeError("协议 Channel 未注册");
+  const order = Number(input.order || 0);
+  if (!Number.isFinite(order)) throw new TypeError("协议转换顺序必须是有限数字");
+  subscriptions.set(input.key, {
+    key: input.key,
+    owner: window.__OpenCodexCurrentProviderScope || null,
+    order,
+    callback: input.callback,
+    propagateErrors: input.propagateErrors === true,
+  });
+  let active = true;
+  return ownProviderDisposer(() => {
+    if (!active) return;
+    active = false;
+    subscriptions.delete(input.key);
+  });
+}
+
+function processProtocol(input: {
+  channel: ProtocolChannelRef;
+  value: unknown;
+  metadata?: Readonly<Record<string, unknown>>;
+}): unknown {
+  if (!protocolChannelTokens.has(input.channel as object)) throw new TypeError("协议转换必须引用宿主 Channel 对象");
+  const subscriptions = protocolTransformSubscriptions.get(input.channel);
+  if (!subscriptions) throw new TypeError("协议 Channel 未注册");
+  if (subscriptions.size === 0) return input.value;
+
+  let currentValue = input.value;
+  let currentFrame = createProtocolFrame(currentValue, input.metadata);
+  const ordered = [...subscriptions.values()].sort((left, right) => left.order - right.order);
+  for (const subscription of ordered) {
+    try {
+      protocolTransformCount += 1;
+      const transformed = runInProviderScope(
+        subscription.owner,
+        () => subscription.callback(currentFrame),
+      );
+      // undefined 明确表示“保持原值”，避免只观察消息的转换器意外改变传输形态。
+      if (transformed !== undefined && transformed !== currentValue) {
+        currentValue = transformed;
+        currentFrame = createProtocolFrame(currentValue, input.metadata);
+      }
+    } catch (error) {
+      if (subscription.propagateErrors) throw error;
+      console.warn("[opencodex-adapter] protocol transformer failed", error);
+    }
+  }
+  return currentValue;
+}
+
 function publishProtocol(input: {
   channel: ProtocolChannelRef;
   value: unknown;
@@ -667,27 +855,7 @@ function publishProtocol(input: {
   const subscriptions = protocolSubscriptions.get(input.channel);
   if (!subscriptions) throw new TypeError("协议 Channel 未注册");
   protocolDispatchCount += 1;
-  let decoded = false;
-  let decodedValue: unknown;
-  const decodeOnce = () => {
-    if (!decoded) {
-      decodedValue = decodeProtocolValue(input.value);
-      decoded = true;
-    }
-    return decodedValue;
-  };
-  const frame = Object.freeze(Object.defineProperties({}, {
-    raw: { enumerable: true, value: input.value },
-    metadata: { enumerable: true, value: Object.freeze({ ...(input.metadata || {}) }) },
-    value: {
-      enumerable: true,
-      get: decodeOnce,
-    },
-    decode: {
-      enumerable: false,
-      value: decodeOnce,
-    },
-  })) as ProtocolFrame;
+  const frame = createProtocolFrame(input.value, input.metadata);
   const results: unknown[] = [];
   for (const subscription of [...subscriptions.values()]) {
     try {
@@ -790,6 +958,8 @@ function createBrowserProviderRegistry() {
       disposers: [],
       applications: new Set(),
       enabledCallbacks: new Set(),
+      lifecycleCallbacks: new Set(),
+      managedFactories: new Map(),
       scope: null,
       enabled: null,
       installed: false,
@@ -875,7 +1045,9 @@ function createBrowserProviderRegistry() {
       setEnabled(enabled: boolean, reason = "插件已关闭") {
         if (state.scope !== scope) return;
         state.enabled = enabled;
+        // Kernel 先恢复或关闭 Contribution 状态，随后资源层再挂载并上报真实命中。
         for (const callback of state.enabledCallbacks) callback(enabled, reason);
+        for (const callback of state.lifecycleCallbacks) callback(enabled);
         publishSnapshot();
       },
       close() {
@@ -890,6 +1062,7 @@ function createBrowserProviderRegistry() {
     state.scope?.close();
     state.scope = null;
     state.installed = false;
+    state.managedFactories.clear();
     let firstError: unknown = null;
     for (const dispose of state.disposers.splice(0).reverse()) {
       try {
@@ -947,6 +1120,7 @@ function createBrowserProviderRegistry() {
     return Object.freeze({
       adapter,
       compile(contributions: readonly BoundContribution[]) {
+        const managedContributions = new Map<symbol, ManagedBrowserContribution>();
         return {
           locate(reporter: AdapterExecutionReporter) {
             for (const contribution of contributions) {
@@ -960,12 +1134,32 @@ function createBrowserProviderRegistry() {
             const state = stateByPointId.get(contribution.point.id);
             if (!state) throw new Error(`修改点没有浏览器 Provider：${contribution.point.id}`);
             ensureInstalled(state);
+            if (isMobileSidebarTouchScrollContribution(contribution)) {
+              const managed = installMobileSidebarTouchScrollContribution(state, () => emit(contribution.point.id));
+              managedContributions.set(contribution.key, managed);
+            }
+            if (isWindowControlsOverlayContribution(contribution)) {
+              const factory = state.managedFactories.get(contribution.point.id);
+              if (!factory) throw new Error("PWA 标题栏 Provider 没有注册托管 Contribution 工厂");
+              // 工厂也在当前 Provider scope 中运行，DOM 监听、计时器等资源因此归属于同一页面代际。
+              try {
+                const managed = runInProviderScope(state.scope, () => factory({
+                  onHit: () => emit(contribution.point.id),
+                }));
+                managedContributions.set(contribution.key, managed);
+              } catch (error) {
+                // 工厂可能已申请部分共享资源；apply 失败时立即释放，不能等待下一次页面切换兜底。
+                releaseStateResources(state);
+                throw error;
+              }
+            }
             state.applications.add(contribution.key);
             reporter.applied(contribution);
           },
           verify(contribution: BoundContribution, reporter: AdapterExecutionReporter) {
             const state = stateByPointId.get(contribution.point.id);
             if (!state?.installed || state.failure) throw state?.failure || new Error("浏览器 Provider 安装后验证失败");
+            managedContributions.get(contribution.key)?.verify();
             reporter.verified(contribution);
           },
           activate(contribution: BoundContribution, reporter: AdapterExecutionReporter) {
@@ -994,6 +1188,8 @@ function createBrowserProviderRegistry() {
           rollback(contribution: BoundContribution) {
             const state = stateByPointId.get(contribution.point.id);
             if (!state) return;
+            managedContributions.get(contribution.key)?.dispose();
+            managedContributions.delete(contribution.key);
             state.applications.delete(contribution.key);
             // 同一 Provider 可被多个修改点和多个底层适配器共享，最后一个引用回滚时才释放真实资源。
             if (state.applications.size === 0) releaseStateResources(state);
@@ -1003,6 +1199,8 @@ function createBrowserProviderRegistry() {
             for (const contribution of contributions) {
               const state = stateByPointId.get(contribution.point.id);
               if (!state) continue;
+              managedContributions.get(contribution.key)?.dispose();
+              managedContributions.delete(contribution.key);
               state.applications.delete(contribution.key);
               affectedStates.add(state);
             }
@@ -1041,6 +1239,25 @@ function createBrowserProviderRegistry() {
     state.installers.push(installer);
   }
 
+  function registerManaged(
+    key: string,
+    pointAlias: string,
+    factory: BrowserManagedContributionFactory,
+  ): void {
+    const state = stateByKey.get(String(key || ""));
+    if (!state) throw new TypeError(`未知浏览器 Provider key：${key}`);
+    const pointId = state.definition.points[String(pointAlias || "")];
+    if (!pointId) throw new TypeError(`浏览器 Provider ${key} 没有修改点别名：${pointAlias}`);
+    if (typeof factory !== "function") throw new TypeError(`浏览器 Provider ${key} 缺少托管工厂`);
+    if (window.__OpenCodexCurrentProviderScope !== state.scope || !state.installing) {
+      throw new Error(`浏览器 Provider ${key} 只能在安装阶段注册托管工厂`);
+    }
+    if (state.managedFactories.has(pointId)) {
+      throw new Error(`浏览器 Provider ${key} 重复注册托管工厂：${pointAlias}`);
+    }
+    state.managedFactories.set(pointId, factory);
+  }
+
   function beginPage(root: Element | null): void {
     if (pageRoot === root) return;
     if (pageRoot) transport()?.beginGeneration?.();
@@ -1064,6 +1281,7 @@ function createBrowserProviderRegistry() {
         console.warn("[opencodex-adapter] browser Provider cleanup failed", state.definition.key, error);
       }
       state.installers.splice(0);
+      state.managedFactories.clear();
       state.enabled = null;
       state.enabledCallbacks.clear();
       state.installing = false;
@@ -1101,7 +1319,7 @@ function createBrowserProviderRegistry() {
     return activationPromise;
   }
 
-  return Object.freeze({ beginPage, register, activate });
+  return Object.freeze({ beginPage, register, registerManaged, activate });
 }
 
 const browserProviders = createBrowserProviderRegistry();
@@ -1117,6 +1335,11 @@ function diagnostics(): AdapterHostDiagnostics {
     protocolDecodeCount,
     protocolDispatchCount,
     protocolSubscriberCount: [...protocolSubscriptions.values()].reduce((total, entries) => total + entries.size, 0),
+    protocolTransformCount,
+    protocolTransformerCount: [...protocolTransformSubscriptions.values()].reduce(
+      (total, entries) => total + entries.size,
+      0,
+    ),
   });
 }
 
@@ -1124,7 +1347,13 @@ const adapterHost = Object.freeze({
   dom: Object.freeze({ observe: observeDom }),
   events: Object.freeze({ observe: observeEvent }),
   hooks: Object.freeze({ around: installAroundHook }),
-  protocol: Object.freeze({ channels: protocolChannels, observe: observeProtocol, publish: publishProtocol }),
+  protocol: Object.freeze({
+    channels: protocolChannels,
+    observe: observeProtocol,
+    process: processProtocol,
+    publish: publishProtocol,
+    transform: transformProtocol,
+  }),
   lifecycle: Object.freeze({ createScope: createBrowserResourceScope }),
   plugins: Object.freeze({ register: registerOwnedPlugin }),
   scheduler: Object.freeze({ capture: captureProviderScheduler }),

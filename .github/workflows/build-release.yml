@@ -1,0 +1,248 @@
+name: Build installers and draft release
+
+on:
+  push:
+
+# 默认只读取仓库内容，创建 Release 的写权限仅授予发布任务。
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    name: Detect release version
+    runs-on: ubuntu-latest
+    outputs:
+      is_release: ${{ steps.version.outputs.is_release }}
+      version: ${{ steps.version.outputs.version }}
+      should_build_artifacts: ${{ steps.changes.outputs.should_build_artifacts }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # 需要比较 push 前后的提交，完整历史可以覆盖多提交 push 的变更范围。
+          fetch-depth: 0
+
+      - name: Detect version bump commit
+        id: version
+        shell: bash
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          # 仅匹配 HEAD commit 的标题，避免普通提交误触发发布流程。
+          commit_subject="${COMMIT_MESSAGE%%$'\n'*}"
+          commit_subject="${commit_subject%$'\r'}"
+
+          if [[ "$commit_subject" =~ ^chore:\ bump\ version\ to\ ([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            version="${BASH_REMATCH[1]}"
+            package_version="$(node --print "require('./package.json').version")"
+
+            # 提交中的版本必须与安装包版本一致，防止创建错误的 Tag 和 Release。
+            if [[ "$version" != "$package_version" ]]; then
+              echo "Version mismatch: commit=$version, package.json=$package_version" >&2
+              exit 1
+            fi
+
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            echo "version=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check whether artifact build is needed
+        id: changes
+        shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          IS_RELEASE: ${{ steps.version.outputs.is_release }}
+        run: |
+          # 发布提交必须继续构建安装包，保证 release 任务始终有完整产物可用。
+          if [[ "$IS_RELEASE" == "true" ]]; then
+            echo "should_build_artifacts=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 新分支没有可比较的 before 提交时保守地执行构建，避免遗漏非文档变更。
+          if [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
+            echo "should_build_artifacts=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 比较失败时保守执行构建，避免因为 Git 历史异常而错误跳过安装包。
+          if ! changed_files="$(git diff --name-only "$BEFORE_SHA" "$AFTER_SHA")"; then
+            echo "Unable to compare push commits; building artifacts" >&2
+            echo "should_build_artifacts=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          should_build_artifacts=false
+          while IFS= read -r changed_file; do
+            [[ -n "$changed_file" ]] || continue
+
+            # 只有根目录 README.md 或 docs/ 下的文档变更时跳过安装包构建。
+            if [[ "$changed_file" != "README.md" && "$changed_file" != docs/* ]]; then
+              should_build_artifacts=true
+              break
+            fi
+          done <<< "$changed_files"
+
+          echo "should_build_artifacts=$should_build_artifacts" >> "$GITHUB_OUTPUT"
+
+  build-macos:
+    name: Build macOS installer (${{ matrix.arch }})
+    needs: metadata
+    if: needs.metadata.outputs.is_release == 'true' || needs.metadata.outputs.should_build_artifacts == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build ad-hoc signed DMG installers
+        run: |
+          pnpm run build
+          # 安装包由后续 job 统一发布，禁止 electron-builder 在 CI 中自动上传。
+          pnpm exec electron-builder --mac dmg --${{ matrix.arch }} --config.mac.identity=- --publish never
+
+      - name: Verify macOS signatures
+        shell: bash
+        run: |
+          # 每个矩阵任务只应生成当前架构的一个顶层应用包。
+          app_count=0
+          while IFS= read -r -d '' app_path; do
+            codesign --verify --deep --strict --verbose=2 "$app_path"
+            ((app_count += 1))
+          done < <(find release -mindepth 2 -maxdepth 2 -type d -name '*.app' -print0)
+
+          if (( app_count != 1 )); then
+            echo "Unexpected application bundles: $app_count" >&2
+            exit 1
+          fi
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          # 外层 Artifact 名称携带完整提交哈希，内部 DMG 文件名保持不变。
+          name: opencodex-macos-${{ matrix.arch }}-${{ github.sha }}
+          path: release/*.dmg
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows installer
+    needs: metadata
+    if: needs.metadata.outputs.is_release == 'true' || needs.metadata.outputs.should_build_artifacts == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build NSIS installer
+        run: |
+          pnpm run build
+          # 安装包由后续 job 统一发布，禁止 electron-builder 在 CI 中自动上传。
+          pnpm exec electron-builder --win nsis --x64 --publish never
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v6
+        with:
+          # 外层 Artifact 名称携带完整提交哈希，内部 EXE 文件名保持不变。
+          name: opencodex-windows-${{ github.sha }}
+          path: release/*.exe
+          if-no-files-found: error
+
+  release:
+    name: Create draft release
+    if: needs.metadata.outputs.is_release == 'true'
+    needs:
+      - metadata
+      - build-macos
+      - build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+    steps:
+      - name: Download installers
+        uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Validate release assets
+        shell: bash
+        run: |
+          shopt -s nullglob
+          dmg_files=(release-assets/*.dmg)
+          exe_files=(release-assets/*.exe)
+
+          # 当前配置应产出 Intel/Apple Silicon 两个 DMG 和一个 Windows 安装包。
+          if (( ${#dmg_files[@]} != 2 || ${#exe_files[@]} != 1 )); then
+            echo "Unexpected assets: ${#dmg_files[@]} DMG, ${#exe_files[@]} EXE" >&2
+            exit 1
+          fi
+
+      - name: Create or update draft release
+        shell: bash
+        run: |
+          shopt -s nullglob
+          assets=(release-assets/*.dmg release-assets/*.exe)
+
+          if gh release view "$RELEASE_VERSION" >/dev/null 2>&1; then
+            # 重跑流水线时仅更新已有草稿，避免覆盖已经正式发布的 Release。
+            is_draft="$(gh release view "$RELEASE_VERSION" --json isDraft --jq '.isDraft')"
+            if [[ "$is_draft" != "true" ]]; then
+              echo "Release $RELEASE_VERSION already exists and is not a draft" >&2
+              exit 1
+            fi
+
+            gh release edit "$RELEASE_VERSION" --title "v$RELEASE_VERSION" --draft=true
+            gh release upload "$RELEASE_VERSION" "${assets[@]}" --clobber
+          else
+            gh release create "$RELEASE_VERSION" "${assets[@]}" \
+              --draft \
+              --target "$GITHUB_SHA" \
+              --title "v$RELEASE_VERSION" \
+              --notes ""
+          fi

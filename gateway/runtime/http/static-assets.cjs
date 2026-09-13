@@ -65,6 +65,7 @@ const RUNTIME_COMPATIBILITY_SCRIPT_PATH = "/opencodex/runtime-compatibility.js";
 const RUNTIME_COMPATIBILITY_STYLE_PATH = "/opencodex/runtime-compatibility.css";
 const OPENCODEX_SIDEBAR_PREVIEW_PATH = "/codex-sidebar-preview.js";
 const OPENCODEX_OFFSCREEN_ANIMATION_GUARD_PATH = "/codex-offscreen-animation-guard.js";
+const CODEX_APP_HOST_MESSAGE_CODEC_PATH = "/codex-app-host-message-codec.js";
 const CODEX_BRIDGE_POLYFILL_PATH = "/codex-bridge-polyfill.js";
 const CODEX_REMOTE_FILE_ACTIONS_PATH = "/codex-remote-file-actions.js";
 const CODEX_WORKSPACE_ROOT_PICKER_CSS_PATH = "/codex-workspace-root-picker.css";
@@ -79,6 +80,11 @@ const OFFICIAL_LOADING_SHIMMER_POWER_GUARD = [
   "</style>",
 ].join("");
 const WEB_SHELL_ASSETS_DIR = path.join(WEB_SHELL_DIR, "assets");
+/**
+ * 官方 main 运行时把“打开方式”菜单图标写成相对路径 `apps/<name>.png`。
+ * 浏览器按当前页面 URL 解析它，因此站点根得到 /apps/，深链路由得到 /<route>/apps/。
+ */
+const OFFICIAL_APP_ICON_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]*\.(?:png|svg|webp|avif|ico|jpe?g|gif)$/i;
 const OPENCODEX_MODIFICATION_RUNTIME_FILE = path.join(
   __dirname,
   "..",
@@ -283,6 +289,7 @@ const WEB_SHELL_STATIC_FILES = new Map([
     OPENCODEX_OFFSCREEN_ANIMATION_GUARD_PATH,
     path.join(INTERNAL_PROVIDER_DIR, "codex-offscreen-animation-guard.js"),
   ],
+  [CODEX_APP_HOST_MESSAGE_CODEC_PATH, path.join(WEB_SHELL_DIR, "codex-app-host-message-codec.js")],
   [CODEX_BRIDGE_POLYFILL_PATH, path.join(INTERNAL_PROVIDER_DIR, "codex-bridge-polyfill.js")],
   [CODEX_REMOTE_FILE_ACTIONS_PATH, path.join(INTERNAL_PROVIDER_DIR, "codex-remote-file-actions.js")],
   [CODEX_WORKSPACE_ROOT_PICKER_CSS_PATH, path.join(WEB_SHELL_DIR, "codex-workspace-root-picker.css")],
@@ -330,6 +337,7 @@ function createStaticAssetService({
   const patchedOfficialPrefixes = Array.from(
     new Set([
       PATCHED_OFFICIAL_PREFIX,
+      "/official-patched-v7/",
       "/official-patched-v6/",
       "/official-patched-v5/",
       "/official-patched-v4/",
@@ -690,6 +698,7 @@ function createStaticAssetService({
         CODEX_SMART_SCHEDULING_SUMMARY_PATH,
         OPENCODEX_TOKEN_USAGE_CAPABILITY_PATH,
         OPENCODEX_WINDOW_CONTROLS_OVERLAY_PATH,
+        CODEX_APP_HOST_MESSAGE_CODEC_PATH,
         CODEX_BRIDGE_POLYFILL_PATH,
         CODEX_REMOTE_FILE_ACTIONS_PATH,
         CODEX_WORKSPACE_ROOT_PICKER_PATH,
@@ -776,6 +785,35 @@ function createStaticAssetService({
       entry.representations.set(encoding, body);
     }
     return { body, encoding };
+  }
+
+  function htmlAttributeValue(attributes, name) {
+    const match = String(attributes || "").match(
+      new RegExp(`(?:^|\\s)${escapeRegExp(name)}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'=<>]+))`, "i")
+    );
+    return match ? match[1] ?? match[2] ?? match[3] ?? "" : null;
+  }
+
+  function hasHtmlAttribute(attributes, name) {
+    return new RegExp(`(?:^|\\s)${escapeRegExp(name)}(?=\\s|=|/|$)`, "i").test(String(attributes || ""));
+  }
+
+  function officialHtmlHasEagerScript(rawHtml) {
+    for (const match of rawHtml.matchAll(/<script\b([^>]*)>/gi)) {
+      const attributes = match[1] || "";
+      const type = String(htmlAttributeValue(attributes, "type") || "").trim().toLowerCase();
+      const moduleScript = type === "module";
+      const classicScript = !type || /(?:java|ecma)script|jscript|livescript/.test(type);
+      // JSON、importmap 等数据脚本不会执行普通 JavaScript，不影响运行时注入顺序。
+      if (!moduleScript && !classicScript) continue;
+      // async 脚本可能在文档解析结束前执行，必须让 Bridge 继续阻塞式抢先安装。
+      if (hasHtmlAttribute(attributes, "async")) return true;
+      if (moduleScript) continue;
+      const deferredExternalScript =
+        htmlAttributeValue(attributes, "src") !== null && hasHtmlAttribute(attributes, "defer");
+      if (!deferredExternalScript) return true;
+    }
+    return false;
   }
 
   function startupAssetPreloads(rawHtml) {
@@ -922,33 +960,38 @@ function createStaticAssetService({
     if (startupPreloads) hitCompatibilityPoint(staticPoints.startupPreload);
     if (previewMarkup) hitCompatibilityPoint(staticPoints.sidebarPreview);
     const useRuntimeBundle = canBundleRuntimeBootstrap();
+    const deferRuntimeScripts = !officialHtmlHasEagerScript(html);
+    const runtimeScript = (src) =>
+      `<script${deferRuntimeScripts ? " defer" : ""} src="${src}"></script>`;
     const runtimeScripts = useRuntimeBundle
       ? [
           '<link rel="preload" as="script" href="/codex-web-config.js">',
           `<link rel="preload" as="script" href="${OPENCODEX_RUNTIME_BOOTSTRAP_PATH}">`,
-          '<script src="/codex-web-config.js"></script>',
-          `<script src="${OPENCODEX_RUNTIME_BOOTSTRAP_PATH}"></script>`,
+          runtimeScript("/codex-web-config.js"),
+          runtimeScript(OPENCODEX_RUNTIME_BOOTSTRAP_PATH),
         ]
       : [
-          '<script src="/codex-web-config.js"></script>',
-          `<script src="${OPENCODEX_MODIFICATION_RUNTIME_PATH}"></script>`,
-          `<script src="${OPENCODEX_RUNTIME_COMPATIBILITY_PATH}"></script>`,
-          `<script src="${OPENCODEX_SIDEBAR_PREVIEW_PATH}"></script>`,
-          `<script src="${OPENCODEX_OFFSCREEN_ANIMATION_GUARD_PATH}"></script>`,
-          `<script src="${OPENCODEX_PLUGIN_SYSTEM_PATH}"></script>`,
-          `<script src="${OPENCODEX_PLUGIN_LOADER_PATH}"></script>`,
-          ...[...BUILTIN_PROVIDER_FILES.keys()].map((url) => `<script src="${url}"></script>`),
-          `<script src="${CODEX_SMART_SCHEDULING_INJECTION_HEALTH_PATH}"></script>`,
-          `<script src="${CODEX_SMART_MODEL_ROUTER_SETTINGS_PATH}"></script>`,
-          `<script src="${CODEX_SMART_MODEL_ROUTER_COMPOSER_PATH}"></script>`,
-          `<script src="${CODEX_SMART_SCHEDULING_SUMMARY_PATH}"></script>`,
-          `<script src="${OPENCODEX_TOKEN_USAGE_CAPABILITY_PATH}"></script>`,
-          `<script src="${OPENCODEX_WINDOW_CONTROLS_OVERLAY_PATH}"></script>`,
-          `<script src="${CODEX_BRIDGE_POLYFILL_PATH}"></script>`,
-          `<script src="${CODEX_REMOTE_FILE_ACTIONS_PATH}"></script>`,
-          `<script src="${CODEX_WORKSPACE_ROOT_PICKER_PATH}"></script>`,
-          `<script src="${CODEX_TOOLTIP_DISMISS_GUARD_PATH}"></script>`,
-          `<script src="${OPENCODEX_MODIFICATION_ACTIVATE_PATH}"></script>`,
+          runtimeScript("/codex-web-config.js"),
+          runtimeScript(OPENCODEX_MODIFICATION_RUNTIME_PATH),
+          runtimeScript(OPENCODEX_RUNTIME_COMPATIBILITY_PATH),
+          runtimeScript(OPENCODEX_SIDEBAR_PREVIEW_PATH),
+          runtimeScript(OPENCODEX_OFFSCREEN_ANIMATION_GUARD_PATH),
+          runtimeScript(OPENCODEX_PLUGIN_SYSTEM_PATH),
+          runtimeScript(OPENCODEX_PLUGIN_LOADER_PATH),
+          ...[...BUILTIN_PROVIDER_FILES.keys()].map(runtimeScript),
+          runtimeScript(CODEX_SMART_SCHEDULING_INJECTION_HEALTH_PATH),
+          runtimeScript(CODEX_SMART_MODEL_ROUTER_SETTINGS_PATH),
+          runtimeScript(CODEX_SMART_MODEL_ROUTER_COMPOSER_PATH),
+          runtimeScript(CODEX_SMART_SCHEDULING_SUMMARY_PATH),
+          runtimeScript(OPENCODEX_TOKEN_USAGE_CAPABILITY_PATH),
+          runtimeScript(OPENCODEX_WINDOW_CONTROLS_OVERLAY_PATH),
+          // codec 先于 bridge 执行，确保新版 AppHost 的首批结构化帧可以立即编码。
+          runtimeScript(CODEX_APP_HOST_MESSAGE_CODEC_PATH),
+          runtimeScript(CODEX_BRIDGE_POLYFILL_PATH),
+          runtimeScript(CODEX_REMOTE_FILE_ACTIONS_PATH),
+          runtimeScript(CODEX_WORKSPACE_ROOT_PICKER_PATH),
+          runtimeScript(CODEX_TOOLTIP_DISMISS_GUARD_PATH),
+          runtimeScript(OPENCODEX_MODIFICATION_ACTIVATE_PATH),
         ];
     // manifest 在 Cloudflare Access 等前置认证后面也必须带同源凭据，否则 Chrome 可能拿不到受保护的 manifest。
     const base = [
@@ -966,7 +1009,6 @@ function createStaticAssetService({
         .join("\n    "),
       OFFICIAL_LOADING_SHIMMER_POWER_GUARD,
       previewMarkup ? sidebarPreviewStyles() : "",
-      `<link id="codex-web-window-controls-overlay-styles" rel="stylesheet" href="${OPENCODEX_WINDOW_CONTROLS_OVERLAY_CSS_PATH}">`,
       `<link id="codex-smart-model-router-settings-styles" rel="stylesheet" href="${CODEX_SMART_MODEL_ROUTER_SETTINGS_CSS_PATH}">`,
       `<link id="codex-smart-scheduling-summary-styles" rel="stylesheet" href="${CODEX_SMART_SCHEDULING_SUMMARY_CSS_PATH}">`,
       `<link id="codex-web-workspace-root-picker-styles" rel="stylesheet" href="${CODEX_WORKSPACE_ROOT_PICKER_CSS_PATH}">`,
@@ -1053,6 +1095,16 @@ function createStaticAssetService({
       .filter((entry) => entry.startsWith(prefix) && entry.endsWith(".css"))
       .sort()[0];
     return fileName ? `/official/assets/${fileName}` : null;
+  }
+
+  /**
+   * 把浏览器解析出的 apps 图标请求映射回官方 webview/apps/ 目录。
+   * 只接受单个图片文件名，避免 /apps/ 变成整个 webview 目录的第二个读入口；
+   * `..` 与 `%2e%2e` 都进不了这条正则，越界路径还会被 locateOfficialAsset 再校验一次。
+   */
+  function locateOfficialAppIcon(relPath) {
+    if (!OFFICIAL_APP_ICON_FILE.test(relPath)) return null;
+    return locateOfficialAsset(`apps/${relPath}`);
   }
 
   function officialAssetFileNames(officialBundle = getOfficialBundle()) {
@@ -1514,6 +1566,9 @@ ${pluginGatewayStateBootstrapScript()}
       const rel = reqPath.slice("/official/".length);
       return locateOfficialAsset(rel);
     }
+    // 官方图标相对路径会带上当前路由前缀，所以按最后一段 apps/<file> 匹配。
+    const appIconMatch = /\/apps\/([^/]+)$/.exec(reqPath);
+    if (appIconMatch) return locateOfficialAppIcon(appIconMatch[1]);
     return null;
   }
 
@@ -1543,6 +1598,8 @@ ${pluginGatewayStateBootstrapScript()}
     if (reqPath.startsWith("/official/assets/")) return "public, max-age=31536000, immutable";
     if (reqPath.startsWith(WEB_SHELL_ASSETS_PREFIX)) return "public, max-age=86400";
     if (reqPath.startsWith("/official/")) return "public, max-age=3600";
+    // 图标名不带 content hash，只做短期缓存，升级换图标后最多一小时内自行刷新。
+    if (/\/apps\/[^/]+\.(?:png|svg|webp|avif|ico|jpe?g|gif)$/i.test(reqPath)) return "public, max-age=3600";
     if (WEB_SHELL_STATIC_FILES.has(reqPath) || reqPath.startsWith(OPENCODEX_PLUGIN_URL_PREFIX)) {
       // 文件名不带 hash，必须每次验证；内容未变时允许 304，避免远端刷新重复传输整套 Web 扩展脚本。
       return "private, no-cache, must-revalidate";

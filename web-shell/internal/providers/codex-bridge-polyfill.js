@@ -40,7 +40,7 @@
   // 官方部分工作区/Git 调用自身允许执行 60 秒；桥接层多留 5 秒传输余量，不能先于官方逻辑超时。
   const IPC_INVOKE_TIMEOUT_MS = 65_000;
   const IPC_WS_MAX_PENDING = 4096;
-  // 单个 UTF-16 code unit 最多占 3 个 UTF-8 字节；16MB 阈值可确保外层 JSON 始终低于服务端 64MB WS 帧上限。
+  // 单个 UTF-16 code unit 最多占 3 个 UTF-8 字节；16MB 阈值可确保外层 JSON 始终低于服务端 100MB WS 帧上限。
   const IPC_WS_MAX_BODY_CHARS = 16 * 1024 * 1024;
   const APP_HOST_RELAY_MAX_ENTRIES = 64;
   const BRIDGE_TOAST_BODY_RETRY_MAX = 12;
@@ -61,20 +61,12 @@
   const WS_INBOUND_LARGE_CHARS = Number(cfg.wsInboundLargeChars || 256 * 1024);
   const WS_INBOUND_PARSE_SLOW_MS = Number(cfg.wsInboundParseSlowMs || 30);
   const WS_INBOUND_HANDLE_SLOW_MS = Number(cfg.wsInboundHandleSlowMs || 80);
-  // app-host RPC 首屏会连续发多条字符串帧；WS 未握手完成前先短暂排队，超过上限直接关闭端口。
+  // app-host RPC 首屏会连续发多条 wire 帧；WS 未握手完成前先短暂排队，超过上限直接关闭端口。
   const APP_HOST_PENDING_MESSAGE_LIMIT = 2000;
   const APP_HOST_PENDING_MESSAGE_CHARS_LIMIT = 16 * 1024 * 1024;
   const GATEWAY_AUTH_LOGOUT_LABEL = t("web.auth.logoutGateway");
   const GATEWAY_AUTH_LOGOUT_BUSY_LABEL = t("web.auth.logoutGatewayBusy");
-  const OFFICIAL_LOGOUT_LABELS = [
-    "退出登录",
-    "Log out",
-    "Logout",
-    "Sign out",
-    "Sign Out",
-    "Sign out of Codex",
-    "Log out of Codex",
-  ];
+  const OFFICIAL_SETTINGS_LABELS = ["设置", "Settings"];
   const MESSAGE_FOR_VIEW_CHANNEL = "codex_desktop:message-for-view";
   const WINDOW_FOCUS_CHANGED_MESSAGE = "electron-window-focus-changed";
 
@@ -165,6 +157,7 @@
   }
 
   const appHostProtocolChannel = adapterHost.protocol.channels.appHost;
+  const gatewayProtocolChannel = adapterHost.protocol.channels.gateway;
   adapterHost.protocol.observe({
     key: {},
     channel: appHostProtocolChannel,
@@ -177,8 +170,38 @@
   });
 
   function publishAppHostData(data, direction) {
-    // 同一帧只在 ProtocolPipeline 中解码一次，再分发给 Token 与智能调度消费者。
-    adapterHost.protocol.publish({ channel: appHostProtocolChannel, value: data, metadata: { direction } });
+    // 转换先于观察和真实转发执行；修改点关闭后 Provider 会自动移除对应转换器。
+    const metadata = { direction, transport: "app-host" };
+    const transformed = adapterHost.protocol.process?.({
+      channel: appHostProtocolChannel,
+      value: data,
+      metadata,
+    }) ?? data;
+    adapterHost.protocol.publish({ channel: appHostProtocolChannel, value: transformed, metadata });
+    return transformed;
+  }
+
+  function publishGatewayData(channel, payload, direction, transport = "bridge") {
+    const metadata = { channel, direction, transport };
+    const envelope = { channel, payload };
+    const transformed = adapterHost.protocol.process?.({
+      channel: gatewayProtocolChannel,
+      value: envelope,
+      metadata,
+    }) ?? envelope;
+    const authoritative =
+      transformed &&
+      typeof transformed === "object" &&
+      transformed.channel === channel &&
+      Object.prototype.hasOwnProperty.call(transformed, "payload")
+        ? transformed
+        : envelope;
+    adapterHost.protocol.publish({
+      channel: gatewayProtocolChannel,
+      value: authoritative,
+      metadata,
+    });
+    return authoritative.payload;
   }
 
   w.__OpenCodexSmartSchedulingBridgeDiagnostics = Object.freeze({
@@ -437,7 +460,6 @@
     locale_source: "IDE",
   };
   const STATSIG_DEFAULT_FEATURE_OVERRIDES = {
-    guardian_approval: true,
     "3903742690": true,
     // 官方新会话的“新工作树”入口由该门控制；Web 本地快照必须保留桌面端已有能力。
     "505458": true,
@@ -1022,10 +1044,10 @@
     ).trim();
   }
 
-  function officialLogoutLabelFromElement(element) {
+  function officialSettingsLabelFromElement(element) {
     const label = elementTextLabel(element).replace(/\s+/g, " ").trim();
     if (!label || label === GATEWAY_AUTH_LOGOUT_LABEL) return "";
-    return OFFICIAL_LOGOUT_LABELS.find((text) => label === text || label.includes(text)) || "";
+    return OFFICIAL_SETTINGS_LABELS.find((text) => label === text || label.startsWith(`${text}…`) || label.startsWith(`${text}...`) || label.startsWith(`${text} `) || label.startsWith(`${text}⌘`)) || "";
   }
 
   function isMenuLikeContext(element) {
@@ -1042,11 +1064,11 @@
     return false;
   }
 
-  function isOfficialLogoutMenuItem(element) {
+  function isOfficialSettingsMenuItem(element) {
     if (!element || element.nodeType !== 1) return false;
     if (element.dataset?.codexWebGatewayAuthLogout === "true") return false;
     if (!visibleElement(element)) return false;
-    if (!officialLogoutLabelFromElement(element)) return false;
+    if (!officialSettingsLabelFromElement(element)) return false;
     if (!isMenuLikeContext(element)) return false;
     const tagName = String(element.tagName || "").toLowerCase();
     const role = String(element.getAttribute?.("role") || "").toLowerCase();
@@ -1139,10 +1161,14 @@
     logoutGatewayAuthFromMenu(item);
   }
 
-  function createGatewayAuthLogoutMenuItem(logoutItem) {
+  function createGatewayAuthLogoutMenuItem(settingsItem) {
     modificationEffects?.gatewayAuthMenu?.emit();
-    const officialLabel = officialLogoutLabelFromElement(logoutItem) || "退出登录";
-    const item = logoutItem.cloneNode(true);
+    const officialLabel = officialSettingsLabelFromElement(settingsItem) || "设置";
+    const item = settingsItem.cloneNode(true);
+    // 复用设置项的样式，但移除它的跳转目标及快捷键提示。
+    item.removeAttribute("href");
+    item.removeAttribute("aria-keyshortcuts");
+    item.querySelectorAll("kbd").forEach((node) => node.remove());
     item.dataset.codexWebGatewayAuthLogout = "true";
     item.dataset.codexWebGatewayAuthOriginalLabel = GATEWAY_AUTH_LOGOUT_LABEL;
     item.setAttribute("aria-label", GATEWAY_AUTH_LOGOUT_LABEL);
@@ -1168,23 +1194,24 @@
     return item;
   }
 
-  function injectGatewayAuthLogoutMenuItem(logoutItem) {
-    const parent = logoutItem && logoutItem.parentElement;
+  function injectGatewayAuthLogoutMenuItem(settingsItem) {
+    const parent = settingsItem && settingsItem.parentElement;
     if (!parent) return false;
     if (Array.from(parent.children || []).some((child) => child.dataset?.codexWebGatewayAuthLogout === "true")) {
       return false;
     }
-    parent.insertBefore(createGatewayAuthLogoutMenuItem(logoutItem), logoutItem);
+    // 设置在账号和 API 登录菜单中均可用，退出认证紧随其后。
+    parent.insertBefore(createGatewayAuthLogoutMenuItem(settingsItem), settingsItem.nextSibling);
     return true;
   }
 
   function scanGatewayAuthLogoutMenuItems(root = document) {
     const scope = root && root.nodeType === 1 ? root : document;
     const candidates = Array.from(scope.querySelectorAll?.("button,a,[role='menuitem'],[role='menuitemradio']") || []);
-    if (scope !== document && isOfficialLogoutMenuItem(scope)) candidates.unshift(scope);
+    if (scope !== document && isOfficialSettingsMenuItem(scope)) candidates.unshift(scope);
     let injected = 0;
     for (const candidate of candidates) {
-      if (isOfficialLogoutMenuItem(candidate) && injectGatewayAuthLogoutMenuItem(candidate)) injected += 1;
+      if (isOfficialSettingsMenuItem(candidate) && injectGatewayAuthLogoutMenuItem(candidate)) injected += 1;
     }
     return injected;
   }
@@ -1396,8 +1423,9 @@
 
   /** Web 适配模块生成的官方入站消息需要同时覆盖 bridge 订阅和 window message 两种消费方式。 */
   function deliverLocalRendererMessage(channel, payload) {
-    const delivered = dispatch(channel, payload);
-    emitWindowMessage(channel, payload);
+    const authoritativePayload = publishGatewayData(channel, payload, "server", "local");
+    const delivered = dispatch(channel, authoritativePayload);
+    emitWindowMessage(channel, authoritativePayload);
     return delivered;
   }
 
@@ -1802,8 +1830,7 @@
 
   /** 发送 fetch-response 给官方 vscode-api 请求管理器。 */
   function emitFetchResponse(payload) {
-    dispatch("fetch-response", payload);
-    emitWindowMessage("fetch-response", payload);
+    deliverLocalRendererMessage("fetch-response", payload);
   }
 
   /** 成功响应 vscode://codex/... fetch IPC，bodyJsonString 必须是 JSON 字符串。 */
@@ -1992,6 +2019,7 @@
     for (const state of appHostPortRelays.values()) {
       if (
         !state.closed &&
+        !state.closing &&
         !state.connected &&
         !state.pending.some((payload) => payload.type === "app-host-connect")
       ) {
@@ -2023,6 +2051,22 @@
   function appHostPortId() {
     // portId 只用于 WebSocket JSON 帧复原 MessagePort 边界，不能暴露官方 RPC 细节。
     return `app-host-${clientId}-${w.crypto?.randomUUID?.() || Math.random().toString(36).slice(2)}`;
+  }
+
+  function appHostMessageCodec() {
+    const codec = w.__OpenCodexAppHostMessageCodec;
+    if (!codec || typeof codec.encodeMessageData !== "function" || typeof codec.decodeMessageData !== "function") {
+      throw new Error("OpenCodex app-host message codec is unavailable");
+    }
+    return codec;
+  }
+
+  function encodeAppHostMessageData(data) {
+    return appHostMessageCodec().encodeMessageData(data);
+  }
+
+  function decodeAppHostMessageData(message) {
+    return appHostMessageCodec().decodeMessageData(message);
   }
 
   function appHostWsPayload(state, payload) {
@@ -2218,6 +2262,10 @@
         if (!sendAppHostWsPayload(state.pending[0])) return;
         const sentPayload = state.pending.shift();
         state.pendingChars = Math.max(0, state.pendingChars - appHostPendingPayloadChars(sentPayload));
+        if (state.closing && state.pending.length === 0) {
+          finalizeAppHostRelay(state);
+          return;
+        }
       }
     } finally {
       state.flushing = false;
@@ -2231,12 +2279,17 @@
   }
 
   function appHostPendingPayloadChars(payload) {
-    // app-host 绝大部分体积都在 JSON-RPC data 字符串；固定控制字段只计一个小额上界。
-    return 256 + (typeof payload?.data === "string" ? payload.data.length : 0);
+    // 固定控制字段计一个小额上界，结构化 wire 数据只统计现成 JSON-safe 形状，不解码 RPC。
+    if (typeof payload?.data === "string") return 256 + payload.data.length;
+    try {
+      return 256 + (Object.prototype.hasOwnProperty.call(payload || {}, "data") ? JSON.stringify(payload.data).length : 0);
+    } catch {
+      return 256;
+    }
   }
 
   function queueAppHostRelayPayload(state, payload) {
-    if (!state || state.closed) return;
+    if (!state || state.closed || state.closing) return;
     const framedPayload = appHostWsPayload(state, payload);
     const nextPendingChars = state.pendingChars + appHostPendingPayloadChars(framedPayload);
     if (
@@ -2264,26 +2317,43 @@
     flushAppHostRelayMessages(state);
   }
 
-  function closeAppHostRelay(state, reason, notifyGateway) {
+  function finalizeAppHostRelay(state) {
     if (!state || state.closed) return;
     state.closed = true;
-    appHostPortRelays.delete(state.portId);
-    if (notifyGateway) {
-      // null 沿用 MessagePort 关闭信号，gateway 收到后会关闭对应的 Electron port。
-      sendAppHostWsPayload(appHostWsPayload(state, { type: "app-host-port-message", data: null }));
-    }
-    try {
-      state.port.close();
-    } catch {}
+    state.closing = false;
+    if (appHostPortRelays.get(state.portId) === state) appHostPortRelays.delete(state.portId);
     // 端口关闭后立刻释放可能很大的离线 RPC 帧，不等待 MessagePort 闭包被垃圾回收。
     state.pending.length = 0;
     state.pendingChars = 0;
     clientDiagnostic("app-host-port-closed", {
       portId: state.portId,
-      reason,
+      reason: state.closeReason || "closed",
       wsReady,
       wsState: websocketStateName(ws),
     });
+  }
+
+  function closeAppHostRelay(state, reason, notifyGateway) {
+    if (!state || state.closed || state.closing) return;
+    state.closing = true;
+    state.closeReason = reason;
+    if (notifyGateway) {
+      // terminal null 进入同一 FIFO；WS 尚未 ready 时也不能静默丢失关闭信号。
+      state.pending.length = 0;
+      state.pendingChars = 0;
+      const terminalPayload = appHostWsPayload(state, { type: "app-host-port-message", data: null });
+      state.pending.push(terminalPayload);
+      state.pendingChars = appHostPendingPayloadChars(terminalPayload);
+    } else if (reason !== "browser_closed") {
+      // gateway/official 已明确终止时无需继续发送旧队列，立即释放本地 relay。
+      state.pending.length = 0;
+      state.pendingChars = 0;
+    }
+    try {
+      state.port.close();
+    } catch {}
+    if (state.pending.length === 0) finalizeAppHostRelay(state);
+    else flushAppHostRelayMessages(state);
   }
 
   function handleAppHostGatewayMessage(message) {
@@ -2328,16 +2398,19 @@
       closeAppHostRelay(state, message.reason || "gateway_close", false);
       return true;
     }
-    const data = Object.prototype.hasOwnProperty.call(message, "data") ? message.data : undefined;
-    if (!(data === null || typeof data === "string")) {
-      // 官方 app-host 当前只传字符串 JSON-RPC；其它类型保持拒绝，避免破坏 renderer 侧协议假设。
-      clientDiagnostic("app-host-non-string-message", {
-        payloadType: payloadShape(data),
+    let data;
+    try {
+      data = decodeAppHostMessageData(message);
+    } catch (error) {
+      clientDiagnostic("app-host-message-decode-failed", {
+        error: error instanceof Error ? error.message : String(error),
+        errorName: error && error.name ? String(error.name) : "",
         portId,
       });
+      closeAppHostRelay(state, "decode_failed", true);
       return true;
     }
-    publishAppHostData(data, "server");
+    data = publishAppHostData(data, "server");
     try {
       state.port.postMessage(data);
       if (data === null) closeAppHostRelay(state, "official_closed", false);
@@ -2370,7 +2443,9 @@
       }
       const state = {
         closed: false,
+        closing: false,
         connected: false,
+        closeReason: "",
         flushing: false,
         pending: [],
         pendingChars: 0,
@@ -2382,22 +2457,30 @@
         if (!oldestRelay) break;
         // 页面组件异常重复创建端口时关闭最旧 relay，不能让每个端口继续持有队列和事件监听。
         closeAppHostRelay(oldestRelay, "relay_limit", true);
+        // 断线期间没有 gateway relay 可通知；必须释放仍在等待 terminal 帧的旧槽位。
+        if (appHostPortRelays.get(oldestRelay.portId) === oldestRelay) finalizeAppHostRelay(oldestRelay);
       }
       appHostPortRelays.set(state.portId, state);
       port.addEventListener("message", (portEvent) => {
-        // MessageEvent.data 可能不是自有属性，直接读取才能拿到官方 RPC 字符串。
-        const portData = portEvent ? portEvent.data : undefined;
-        if (!(portData === null || typeof portData === "string")) {
-          clientDiagnostic("app-host-browser-non-string-message", {
-            payloadType: payloadShape(portData),
+        if (state.closed || state.closing) return;
+        // MessageEvent.data 可能不是自有属性，直接读取才能拿到新版结构化 RPC 值。
+        const originalPortData = portEvent ? portEvent.data : undefined;
+        const portData = publishAppHostData(originalPortData, "client");
+        let wireData;
+        try {
+          wireData = encodeAppHostMessageData(portData);
+        } catch (error) {
+          clientDiagnostic("app-host-browser-message-encode-failed", {
+            error: error instanceof Error ? error.message : String(error),
+            errorName: error && error.name ? String(error.name) : "",
             portId: state.portId,
           });
+          closeAppHostRelay(state, "encode_failed", true);
           return;
         }
-        // 当前官方 Web 路由固定为根路径；展示模块需从本标签页发出的 RPC 识别正在查看的 thread。
-        publishAppHostData(portData, "client");
-        queueAppHostRelayPayload(state, { type: "app-host-port-message", data: portData });
-        if (portData === null) closeAppHostRelay(state, "browser_closed", false);
+        queueAppHostRelayPayload(state, { type: "app-host-port-message", ...wireData });
+        // 保留旧版 null 关闭语义；新版 renderer 的 undefined 终止帧编码后也只发送一次。
+        if (originalPortData === null || originalPortData === undefined) closeAppHostRelay(state, "browser_closed", false);
       });
       port.addEventListener("messageerror", () => {
         clientDiagnostic("app-host-browser-message-error", { portId: state.portId });
@@ -2405,7 +2488,7 @@
       });
       /**
        * 官方 preload 会把 connect-app-host 的 port 直接转给 ipcRenderer.postMessage。
-       * Web 端不能跨进程传 MessagePort，所以这里先发 connect 控制帧，再透明转发后续字符串 RPC。
+       * Web 端不能跨进程传 MessagePort，所以这里先发 connect 控制帧，再兼容转发旧字符串和新版结构化 RPC。
        */
       queueAppHostRelayPayload(state, { type: "app-host-connect" });
       port.start();
@@ -2902,12 +2985,17 @@
 
   const sharedObjectSnapshot = new Map();
   const persistedAtomSnapshot = new Map();
+  const PENDING_WORKTREES_KEY = "pending_worktrees";
   const COMPOSER_PERMISSION_MODE_VISIBILITY_KEY = "composer-permission-mode-visibility";
   const DEFAULT_COMPOSER_PERMISSION_MODE_VISIBILITY = {
     "guardian-approvals": true,
     "full-access": true,
   };
-  const PINNED_SHARED_OBJECT_SNAPSHOT_KEYS = new Set(["host_config", STATSIG_DEFAULT_FEATURES_CONFIG]);
+  const PINNED_SHARED_OBJECT_SNAPSHOT_KEYS = new Set([
+    "host_config",
+    STATSIG_DEFAULT_FEATURES_CONFIG,
+    PENDING_WORKTREES_KEY,
+  ]);
   const PINNED_PERSISTED_ATOM_SNAPSHOT_KEYS = new Set([
     "prompt-history",
     COMPOSER_PERMISSION_MODE_VISIBILITY_KEY,
@@ -2932,8 +3020,10 @@
     return value !== null && typeof value === "object" && !Array.isArray(value);
   }
 
-  /** shared-object snapshot 写入前补齐 Web 必需 feature flag。 */
+  /** shared-object snapshot 写入前补齐 Web 必需的已知形态。 */
   function normalizeSharedObjectSnapshotValue(key, value) {
+    // 官方 pending_worktrees 消费者只接受数组或 undefined；Web 首屏缺值不能以 null 注入其状态机。
+    if (key === PENDING_WORKTREES_KEY) return Array.isArray(value) ? value : undefined;
     if (key !== STATSIG_DEFAULT_FEATURES_CONFIG) return value;
     return {
       ...(isPlainObject(value) ? value : {}),
@@ -2947,13 +3037,23 @@
     const normalized = normalizeSharedObjectSnapshotValue(key, value);
     // 重写已有键时刷新 LRU 顺序，避免活跃状态被一次性的扩展键挤出。
     sharedObjectSnapshot.delete(key);
+    // 对齐官方 preload：undefined 表示尚无快照，不能作为一个已加载值留在 Map 中。
+    if (key === PENDING_WORKTREES_KEY && normalized === undefined) return undefined;
     sharedObjectSnapshot.set(key, normalized);
     trimSnapshotMap(sharedObjectSnapshot, SHARED_OBJECT_SNAPSHOT_MAX_ENTRIES, PINNED_SHARED_OBJECT_SNAPSHOT_KEYS);
     return normalized;
   }
 
-  /** 读取 shared-object snapshot，特定 key 会懒补默认值。 */
+  /** 记录官方 shared-object 回包，并按各已知 key 的消费约定规范化值。 */
+  function cacheSharedObjectUpdatedPayload(payload) {
+    if (!isPlainObject(payload) || !payload.key) return payload;
+    const value = setSharedObjectSnapshotValue(payload.key, payload.value);
+    return value === payload.value ? payload : { ...payload, value };
+  }
+
+  /** 读取 shared-object snapshot：Statsig 懒补默认值，pending_worktrees 保留官方缺失语义。 */
   function getSharedObjectSnapshotValue(key) {
+    if (key === PENDING_WORKTREES_KEY && !sharedObjectSnapshot.has(key)) return undefined;
     if (key === STATSIG_DEFAULT_FEATURES_CONFIG || sharedObjectSnapshot.has(key)) {
       return setSharedObjectSnapshotValue(key, sharedObjectSnapshot.get(key));
     }
@@ -3115,6 +3215,11 @@
     target.startFileDrag = () => false;
     target.sendMessageFromView = async (payload) =>
       Promise.resolve().then(() => {
+        const protocolChannel =
+          payload && typeof payload === "object" && typeof payload.type === "string"
+            ? payload.type
+            : "view:message";
+        payload = publishGatewayData(protocolChannel, payload, "client");
         if (payload && typeof payload === "object" && payload.type === "persisted-atom-sync-request") {
           modificationEffects?.persistedAtom?.emit();
           // 官方 renderer 首屏会很早请求 persisted atom；这里先本地回包，避免 WS 未连接导致回包丢失。
@@ -3139,7 +3244,7 @@
         }
         if (payload && typeof payload === "object" && payload.type === "shared-object-subscribe" && payload.key) {
           modificationEffects?.sharedObject?.emit();
-          emitSharedObjectSnapshotValue(payload.key);
+          // 初始订阅只交给官方 runtime 回包，避免本地快照与官方权威值竞争覆盖 renderer 状态。
         }
         if (payload && typeof payload === "object" && payload.type === "open-in-browser" && payload.url) {
           return openExternal(payload.url);
@@ -3629,7 +3734,16 @@
             surfaceFetchIpcError("fetch-stream-error", messagePayload);
           }
           handleTokenUsageGatewayPayload(messagePayload);
-          const rendererMessagePayload = browserRendererMessagePayload(effectiveChannel, messagePayload);
+          const authoritativeMessagePayload =
+            effectiveChannel === "shared-object-updated"
+              ? cacheSharedObjectUpdatedPayload(messagePayload)
+              : messagePayload;
+          const rendererMessagePayload = publishGatewayData(
+            effectiveChannel,
+            browserRendererMessagePayload(effectiveChannel, authoritativeMessagePayload),
+            "server",
+            "gateway-ws"
+          );
           if (shouldDispatchGatewayMessage(msg.channel, effectiveChannel)) {
             dispatch(effectiveChannel, rendererMessagePayload);
           }
